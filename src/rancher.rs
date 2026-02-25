@@ -156,6 +156,7 @@ impl RancherClient {
         let payload = HashMap::from([
             ("username", server.username.as_str()),
             ("password", password.expose()),
+            ("responseType", "token"),
         ]);
 
         let auth: AuthResponse = self
