@@ -122,10 +122,26 @@ fn cmd_list(config_path: &Path) -> Result<()> {
     for server in &cfg.servers {
         println!(
             "  {} (user: {}, auth: {:?})",
-            server.api_base(),
+            server.api_base().cyan(),
             server.username,
             server.auth_type
         );
+        match &server.cached_token {
+            Some(token) if token.is_valid() => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                let days = (token.expires_at() - now) / 86400;
+                println!("    token: {}", format!("{days} days remaining").green());
+            }
+            Some(_) => {
+                println!("    token: {}", "expired".red());
+            }
+            None => {
+                println!("    token: {}", "none".dimmed());
+            }
+        }
     }
 
     Ok(())
@@ -175,7 +191,7 @@ async fn authenticate_servers(
                 "Authenticating to {}... {} {}",
                 server.api_base().cyan(),
                 "ok".green(),
-                "(cached)".dimmed()
+                "(token)".dimmed()
             );
             tokens.insert(server.url().clone(), AuthToken::from_cached(cached));
             continue;
