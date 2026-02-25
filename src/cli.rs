@@ -58,6 +58,9 @@ pub enum Command {
         target: String,
     },
 
+    /// Print version
+    Version,
+
     /// Fetch kubeconfigs from all Rancher servers
     Fetch {
         /// Output path for merged kubeconfig
@@ -79,6 +82,10 @@ pub enum Command {
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
+    if let Command::Version = cli.command {
+        return cmd_version();
+    }
+
     let config_path = cli
         .config
         .unwrap_or_else(|| config::config_path().expect("could not determine config path"));
@@ -97,7 +104,13 @@ pub async fn run(cli: Cli) -> Result<()> {
             insecure,
             force_refresh,
         } => cmd_fetch(&config_path, output, exclude, insecure, force_refresh).await,
+        Command::Version => unreachable!(),
     }
+}
+
+fn cmd_version() -> Result<()> {
+    println!("roundup {}", env!("CARGO_PKG_VERSION"));
+    Ok(())
 }
 
 fn cmd_add(config_path: &Path, url: &str, username: String, authtype: AuthType) -> Result<()> {
