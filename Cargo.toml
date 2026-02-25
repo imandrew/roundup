@@ -1,6 +1,6 @@
 [package]
 name = "roundup"
-version = "0.1.1"
+version = "0.1.2"
 authors = []
 description = "CLI tool for fetching and merging kubeconfigs from multiple Rancher servers"
 homepage = "https://github.com/imandrew/roundup"

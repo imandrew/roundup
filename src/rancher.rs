@@ -156,7 +156,6 @@ impl RancherClient {
         let payload = HashMap::from([
             ("username", server.username.as_str()),
             ("password", password.expose()),
-            ("responseType", "token"),
         ]);
 
         let auth: AuthResponse = self
@@ -166,6 +165,51 @@ impl RancherClient {
         let token_value = auth.token.ok_or_else(|| RancherError::NoToken { url })?;
 
         // Cap TTL to 30 days to prevent overflow from extreme server values.
+        const MAX_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+        let expires_at = if auth.ttl > 0 {
+            let ttl_ms = auth.ttl.min(MAX_TTL_MS) as u64;
+            Instant::now() + Duration::from_millis(ttl_ms)
+        } else {
+            Instant::now() + DEFAULT_TOKEN_TTL
+        };
+
+        Ok(AuthToken {
+            value: token_value,
+            expires_at,
+        })
+    }
+
+    /// Create a derived API token from a session token. Derived tokens can be
+    /// deleted, have longer TTLs, and persist across sessions.
+    pub async fn create_api_token(
+        &self,
+        server: &Server,
+        session_token: &AuthToken,
+    ) -> Result<AuthToken, RancherError> {
+        let url = format!("{}/v3/tokens", server.api_base());
+
+        let payload = HashMap::from([
+            ("type", "token"),
+            ("description", "roundup"),
+        ]);
+
+        let auth: AuthResponse = self
+            .send_and_parse(
+                || {
+                    self.client
+                        .post(&url)
+                        .bearer_auth(session_token.value())
+                        .json(&payload)
+                        .send()
+                },
+                url.clone(),
+            )
+            .await?;
+
+        let token_value = auth.token.ok_or_else(|| RancherError::NoToken {
+            url: url.clone(),
+        })?;
+
         const MAX_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
         let expires_at = if auth.ttl > 0 {
             let ttl_ms = auth.ttl.min(MAX_TTL_MS) as u64;
@@ -205,20 +249,23 @@ impl RancherClient {
             .collect())
     }
 
-    /// Delete a token from the Rancher server. Best-effort — errors are returned
-    /// but callers may choose to ignore them.
+    /// Delete a token from the Rancher server using a separate token for
+    /// authentication. This allows deleting a derived token by authenticating
+    /// with a session token. Best-effort — errors are returned but callers may
+    /// choose to ignore them.
     pub async fn delete_token(
         &self,
         server: &Server,
-        token: &AuthToken,
+        token_to_delete: &AuthToken,
+        auth_token: &AuthToken,
     ) -> Result<(), RancherError> {
-        let Some(token_id) = token.token_id() else {
+        let Some(token_id) = token_to_delete.token_id() else {
             return Ok(());
         };
         let url = format!("{}/v3/tokens/{}", server.api_base(), token_id);
 
         let resp = self
-            .send_with_retry(|| self.client.delete(&url).bearer_auth(token.value()).send())
+            .send_with_retry(|| self.client.delete(&url).bearer_auth(auth_token.value()).send())
             .await
             .map_err(|source| RancherError::Http {
                 url: url.clone(),
@@ -594,12 +641,19 @@ mod tests {
 
         let client = test_client();
         let server = test_server(&mock.uri());
-        let token = AuthToken::new(
+        let token_to_delete = AuthToken::new(
             "token-abc123:secretvalue".into(),
             Instant::now() + Duration::from_secs(3600),
         );
+        let auth_token = AuthToken::new(
+            "session-token:authvalue".into(),
+            Instant::now() + Duration::from_secs(3600),
+        );
 
-        client.delete_token(&server, &token).await.unwrap();
+        client
+            .delete_token(&server, &token_to_delete, &auth_token)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -614,12 +668,73 @@ mod tests {
 
         let client = test_client();
         let server = test_server(&mock.uri());
-        let token = AuthToken::new(
+        let token_to_delete = AuthToken::new(
             "token-gone:secretvalue".into(),
             Instant::now() + Duration::from_secs(3600),
         );
+        let auth_token = AuthToken::new(
+            "session-token:authvalue".into(),
+            Instant::now() + Duration::from_secs(3600),
+        );
 
-        let err = client.delete_token(&server, &token).await.unwrap_err();
+        let err = client
+            .delete_token(&server, &token_to_delete, &auth_token)
+            .await
+            .unwrap_err();
         assert!(matches!(err, RancherError::Api { status: 404, .. }));
+    }
+
+    #[tokio::test]
+    async fn create_api_token_success() {
+        let mock = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v3/tokens"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "token": "token-derived:apikey123",
+                "ttl": 7776000000_i64
+            })))
+            .mount(&mock)
+            .await;
+
+        let client = test_client();
+        let server = test_server(&mock.uri());
+        let session_token = AuthToken::new(
+            "session-token:sessionvalue".into(),
+            Instant::now() + Duration::from_secs(3600),
+        );
+
+        let api_token = client
+            .create_api_token(&server, &session_token)
+            .await
+            .unwrap();
+
+        assert_eq!(api_token.value(), "token-derived:apikey123");
+        assert!(api_token.is_valid());
+    }
+
+    #[tokio::test]
+    async fn create_api_token_rejected() {
+        let mock = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v3/tokens"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
+            .mount(&mock)
+            .await;
+
+        let client = test_client();
+        let server = test_server(&mock.uri());
+        let session_token = AuthToken::new(
+            "session-token:sessionvalue".into(),
+            Instant::now() + Duration::from_secs(3600),
+        );
+
+        let err = client
+            .create_api_token(&server, &session_token)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, RancherError::Api { status: 403, .. }));
     }
 }

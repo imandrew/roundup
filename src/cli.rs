@@ -71,6 +71,10 @@ pub enum Command {
         /// Skip TLS certificate verification
         #[arg(long)]
         insecure: bool,
+
+        /// Force re-authentication, ignoring cached tokens
+        #[arg(long)]
+        force_refresh: bool,
     },
 }
 
@@ -91,7 +95,8 @@ pub async fn run(cli: Cli) -> Result<()> {
             output,
             exclude,
             insecure,
-        } => cmd_fetch(&config_path, output, exclude, insecure).await,
+            force_refresh,
+        } => cmd_fetch(&config_path, output, exclude, insecure, force_refresh).await,
     }
 }
 
@@ -141,10 +146,12 @@ fn cmd_remove(config_path: &Path, target: &str) -> Result<()> {
 
 /// Authenticate all servers, reusing cached tokens where valid and prompting for
 /// passwords otherwise. Tokens expiring within 1 day are proactively rotated.
+/// Uses a two-step flow: login for a session token, then create a derived API token.
 /// Returns the token map and whether any tokens were refreshed (config needs saving).
 async fn authenticate_servers(
     client: &RancherClient,
     servers: &mut [Server],
+    force_refresh: bool,
 ) -> Result<(HashMap<Url, AuthToken>, bool)> {
     if servers.len() > 1 && std::env::var("ROUNDUP_RANCHER_PASSWORD").is_ok() {
         eprintln!(
@@ -158,7 +165,8 @@ async fn authenticate_servers(
     let mut changed = false;
 
     for server in servers {
-        if let Some(cached) = &server.cached_token
+        if !force_refresh
+            && let Some(cached) = &server.cached_token
             && cached.is_valid()
             && !cached.expires_within(TOKEN_REFRESH_BUFFER_SECS)
         {
@@ -173,12 +181,15 @@ async fn authenticate_servers(
             continue;
         }
 
-        // Delete the old token from Rancher if one exists
-        if let Some(cached) = &server.cached_token {
-            let old_token = AuthToken::from_cached(cached);
-            if let Err(e) = client.delete_token(server, &old_token).await {
-                warn!(server = %server.api_base(), error = %e, "failed to delete old token");
-            }
+        // Tell the user why we're re-authenticating when the token is expiring
+        if let Some(cached) = &server.cached_token
+            && cached.is_valid()
+            && cached.expires_within(TOKEN_REFRESH_BUFFER_SECS)
+        {
+            println!(
+                "Token for {} expires soon, refreshing...",
+                server.api_base().cyan()
+            );
         }
 
         info!(server = %server.api_base(), "authenticating");
@@ -186,10 +197,27 @@ async fn authenticate_servers(
             "Authenticating to {}... password: ",
             server.api_base().cyan()
         ))?;
-        let token = client
+
+        // Step 1: Login to get a session token
+        let session_token = client
             .authenticate(server, &pw)
             .await
             .with_context(|| format!("authentication failed for {}", server.api_base()))?;
+
+        // Step 2: Delete old cached token using the session token (best-effort)
+        if let Some(cached) = &server.cached_token {
+            let old_token = AuthToken::from_cached(cached);
+            if let Err(e) = client.delete_token(server, &old_token, &session_token).await {
+                warn!(server = %server.api_base(), error = %e, "failed to delete old token");
+            }
+        }
+
+        // Step 3: Create a derived API token (deletable, longer TTL)
+        let token = client
+            .create_api_token(server, &session_token)
+            .await
+            .with_context(|| format!("failed to create API token for {}", server.api_base()))?;
+
         println!(
             "Authenticating to {}... {}",
             server.api_base().cyan(),
@@ -208,6 +236,7 @@ async fn cmd_fetch(
     output: Option<PathBuf>,
     exclude: Vec<String>,
     insecure: bool,
+    force_refresh: bool,
 ) -> Result<()> {
     let mut cfg = Config::load(config_path)?;
 
@@ -229,7 +258,8 @@ async fn cmd_fetch(
         .context("failed to create HTTP client")?;
 
     // Phase 1: Authenticate
-    let (tokens, config_changed) = authenticate_servers(&client, &mut cfg.servers).await?;
+    let (tokens, config_changed) =
+        authenticate_servers(&client, &mut cfg.servers, force_refresh).await?;
 
     if config_changed {
         cfg.save(config_path)?;
