@@ -1,0 +1,46 @@
+[package]
+name = "roundup"
+version = "0.1.0"
+authors = []
+description = "CLI tool for fetching and merging kubeconfigs from multiple Rancher servers"
+homepage = "https://github.com/imandrew/roundup"
+repository = "https://github.com/imandrew/roundup"
+readme = "README.md"
+keywords = ["kubernetes", "kube", "rancher", "cli"]
+license = "MIT"
+edition = "2024"
+
+[profile.release]
+lto = true
+strip = true
+
+[profile.dist]
+inherits = "release"
+
+[[bin]]
+name = "roundup"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4.5.60", features = ["derive"] }
+dirs = "6.0.0"
+governor = "0.10.4"
+owo-colors = "4"
+regex = "1.12.3"
+reqwest = { version = "0.13.2", features = ["json"] }
+rpassword = "7.4.0"
+serde = { version = "1.0.228", features = ["derive"] }
+yaml_serde = "0.10"
+thiserror = "2.0.18"
+tokio = { version = "1.49.0", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+url = { version = "2.5.8", features = ["serde"] }
+zeroize = "1"
+
+[dev-dependencies]
+serde_json = "1.0.149"
+temp-env = "0.3.6"
+tempfile = "3.25.0"
+wiremock = "0.6.5"
