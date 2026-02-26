@@ -12,7 +12,7 @@ use url::Url;
 use crate::config::{self, AuthType, Config, Server};
 use crate::kubeconfig::{self, ExcludeFilter};
 use crate::password::read_password;
-use crate::rancher::{AuthToken, RancherClient};
+use crate::rancher::{ApiToken, RancherClient};
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(600);
 /// Rotate tokens expiring within 1 day.
@@ -181,7 +181,7 @@ async fn authenticate_servers(
     client: &RancherClient,
     servers: &mut [Server],
     force_refresh: bool,
-) -> Result<(HashMap<Url, AuthToken>, bool)> {
+) -> Result<(HashMap<Url, ApiToken>, bool)> {
     if servers.len() > 1 && std::env::var("ROUNDUP_RANCHER_PASSWORD").is_ok() {
         eprintln!(
             "{}: ROUNDUP_RANCHER_PASSWORD is set and will be used for all {} servers",
@@ -206,7 +206,7 @@ async fn authenticate_servers(
                 "ok".green(),
                 "(token)".dimmed()
             );
-            tokens.insert(server.url().clone(), AuthToken::from_cached(cached));
+            tokens.insert(server.url().clone(), ApiToken::from_cached(cached));
             continue;
         }
 
@@ -235,8 +235,11 @@ async fn authenticate_servers(
 
         // Step 2: Delete old cached token using the session token (best-effort)
         if let Some(cached) = &server.cached_token {
-            let old_token = AuthToken::from_cached(cached);
-            if let Err(e) = client.delete_token(server, &old_token, &session_token).await {
+            let old_token = ApiToken::from_cached(cached);
+            if let Err(e) = client
+                .delete_token(server, &old_token, &session_token)
+                .await
+            {
                 warn!(server = %server.api_base(), error = %e, "failed to delete old token");
             }
         }
@@ -246,6 +249,9 @@ async fn authenticate_servers(
             .create_api_token(server, &session_token)
             .await
             .with_context(|| format!("failed to create API token for {}", server.api_base()))?;
+
+        // Step 4: Invalidate the ephemeral session token
+        client.logout(server, &session_token).await;
 
         println!(
             "Authenticating to {}... {}",

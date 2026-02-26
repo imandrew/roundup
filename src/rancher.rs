@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::config::{CachedToken, Password, Server};
 
@@ -35,18 +35,18 @@ pub enum RancherError {
 }
 
 #[derive(Clone)]
-pub struct AuthToken {
+pub struct ApiToken {
     value: String,
     expires_at: Instant,
 }
 
-impl std::fmt::Debug for AuthToken {
+impl std::fmt::Debug for ApiToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("AuthToken(***)")
+        f.write_str("ApiToken(***)")
     }
 }
 
-impl AuthToken {
+impl ApiToken {
     #[cfg(test)]
     pub fn new(value: String, expires_at: Instant) -> Self {
         Self { value, expires_at }
@@ -90,6 +90,27 @@ impl AuthToken {
     }
 }
 
+/// Ephemeral session token returned by `authenticate()`. Used to create
+/// derived API tokens and then discarded — no expiry tracking needed.
+pub struct SessionToken(String);
+
+impl SessionToken {
+    #[cfg(test)]
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn value(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SessionToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SessionToken(***)")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Cluster {
     pub id: String,
@@ -99,6 +120,11 @@ pub struct Cluster {
 
 #[derive(Deserialize)]
 struct AuthResponse {
+    token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CreateTokenResponse {
     token: Option<String>,
     ttl: i64,
 }
@@ -126,8 +152,6 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_RETRIES: u32 = 3;
 const DEFAULT_RATE_PER_SEC: u32 = 10;
 const DEFAULT_RATE_BURST: u32 = 20;
-/// Rancher's typical default session TTL.
-const DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(16 * 60 * 60);
 
 #[derive(Clone)]
 pub struct RancherClient {
@@ -146,7 +170,7 @@ impl RancherClient {
         &self,
         server: &Server,
         password: &Password,
-    ) -> Result<AuthToken, RancherError> {
+    ) -> Result<SessionToken, RancherError> {
         let url = format!(
             "{}/v3-public/{}?action=login",
             server.api_base(),
@@ -164,19 +188,7 @@ impl RancherClient {
 
         let token_value = auth.token.ok_or_else(|| RancherError::NoToken { url })?;
 
-        // Cap TTL to 30 days to prevent overflow from extreme server values.
-        const MAX_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
-        let expires_at = if auth.ttl > 0 {
-            let ttl_ms = auth.ttl.min(MAX_TTL_MS) as u64;
-            Instant::now() + Duration::from_millis(ttl_ms)
-        } else {
-            Instant::now() + DEFAULT_TOKEN_TTL
-        };
-
-        Ok(AuthToken {
-            value: token_value,
-            expires_at,
-        })
+        Ok(SessionToken(token_value))
     }
 
     /// Create a derived API token from a session token. Derived tokens can be
@@ -184,16 +196,13 @@ impl RancherClient {
     pub async fn create_api_token(
         &self,
         server: &Server,
-        session_token: &AuthToken,
-    ) -> Result<AuthToken, RancherError> {
+        session_token: &SessionToken,
+    ) -> Result<ApiToken, RancherError> {
         let url = format!("{}/v3/tokens", server.api_base());
 
-        let payload = HashMap::from([
-            ("type", "token"),
-            ("description", "roundup"),
-        ]);
+        let payload = HashMap::from([("type", "token"), ("description", "roundup")]);
 
-        let auth: AuthResponse = self
+        let resp: CreateTokenResponse = self
             .send_and_parse(
                 || {
                     self.client
@@ -206,19 +215,13 @@ impl RancherClient {
             )
             .await?;
 
-        let token_value = auth.token.ok_or_else(|| RancherError::NoToken {
-            url: url.clone(),
-        })?;
+        let token_value = resp
+            .token
+            .ok_or_else(|| RancherError::NoToken { url: url.clone() })?;
 
-        const MAX_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
-        let expires_at = if auth.ttl > 0 {
-            let ttl_ms = auth.ttl.min(MAX_TTL_MS) as u64;
-            Instant::now() + Duration::from_millis(ttl_ms)
-        } else {
-            Instant::now() + DEFAULT_TOKEN_TTL
-        };
+        let expires_at = Instant::now() + Duration::from_millis(resp.ttl as u64);
 
-        Ok(AuthToken {
+        Ok(ApiToken {
             value: token_value,
             expires_at,
         })
@@ -227,7 +230,7 @@ impl RancherClient {
     pub async fn list_clusters(
         &self,
         server: &Server,
-        token: &AuthToken,
+        token: &ApiToken,
     ) -> Result<Vec<Cluster>, RancherError> {
         let url = format!("{}/v3/clusters", server.api_base());
 
@@ -249,15 +252,15 @@ impl RancherClient {
             .collect())
     }
 
-    /// Delete a token from the Rancher server using a separate token for
-    /// authentication. This allows deleting a derived token by authenticating
-    /// with a session token. Best-effort — errors are returned but callers may
-    /// choose to ignore them.
+    /// Delete a token from the Rancher server using a session token for
+    /// authentication. This allows deleting a derived API token by authenticating
+    /// with an ephemeral session token. Best-effort — errors are returned but
+    /// callers may choose to ignore them.
     pub async fn delete_token(
         &self,
         server: &Server,
-        token_to_delete: &AuthToken,
-        auth_token: &AuthToken,
+        token_to_delete: &ApiToken,
+        auth_token: &SessionToken,
     ) -> Result<(), RancherError> {
         let Some(token_id) = token_to_delete.token_id() else {
             return Ok(());
@@ -265,7 +268,12 @@ impl RancherClient {
         let url = format!("{}/v3/tokens/{}", server.api_base(), token_id);
 
         let resp = self
-            .send_with_retry(|| self.client.delete(&url).bearer_auth(auth_token.value()).send())
+            .send_with_retry(|| {
+                self.client
+                    .delete(&url)
+                    .bearer_auth(auth_token.value())
+                    .send()
+            })
             .await
             .map_err(|source| RancherError::Http {
                 url: url.clone(),
@@ -276,10 +284,39 @@ impl RancherClient {
         Ok(())
     }
 
+    /// Invalidate a session token via Rancher's logout action. Best-effort —
+    /// logs a warning on failure but never fails the caller's flow.
+    pub async fn logout(&self, server: &Server, session_token: &SessionToken) {
+        let url = format!("{}/v3/tokens?action=logout", server.api_base());
+
+        let result = self
+            .send_with_retry(|| {
+                self.client
+                    .post(&url)
+                    .bearer_auth(session_token.value())
+                    .send()
+            })
+            .await;
+
+        match result {
+            Ok(resp) if resp.status().is_success() => {}
+            Ok(resp) => {
+                warn!(
+                    server = %server.api_base(),
+                    status = resp.status().as_u16(),
+                    "session logout returned non-success status"
+                );
+            }
+            Err(e) => {
+                warn!(server = %server.api_base(), error = %e, "session logout failed");
+            }
+        }
+    }
+
     pub async fn get_kubeconfig(
         &self,
         server: &Server,
-        token: &AuthToken,
+        token: &ApiToken,
         cluster_id: &str,
     ) -> Result<String, RancherError> {
         if !cluster_id
@@ -442,8 +479,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v3-public/localProviders/local"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "token": "kubeconfig-user:abc123",
-                "ttl": 3600000
+                "token": "kubeconfig-user:abc123"
             })))
             .mount(&mock)
             .await;
@@ -456,7 +492,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(token.value(), "kubeconfig-user:abc123");
-        assert!(token.is_valid());
     }
 
     #[tokio::test]
@@ -485,9 +520,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/v3-public/localProviders/local"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "ttl": 3600000
-            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
             .mount(&mock)
             .await;
 
@@ -518,7 +551,7 @@ mod tests {
 
         let client = test_client();
         let server = test_server(&mock.uri());
-        let token = AuthToken::new(
+        let token = ApiToken::new(
             "test-token".into(),
             Instant::now() + Duration::from_secs(3600),
         );
@@ -548,7 +581,7 @@ mod tests {
 
         let client = test_client();
         let server = test_server(&mock.uri());
-        let token = AuthToken::new(
+        let token = ApiToken::new(
             "test-token".into(),
             Instant::now() + Duration::from_secs(3600),
         );
@@ -574,7 +607,7 @@ mod tests {
 
         let client = test_client();
         let server = test_server(&mock.uri());
-        let token = AuthToken::new(
+        let token = ApiToken::new(
             "test-token".into(),
             Instant::now() + Duration::from_secs(3600),
         );
@@ -598,7 +631,7 @@ mod tests {
 
         let client = test_client();
         let server = test_server(&mock.uri());
-        let token = AuthToken::new(
+        let token = ApiToken::new(
             "test-token".into(),
             Instant::now() + Duration::from_secs(3600),
         );
@@ -613,7 +646,7 @@ mod tests {
 
     #[test]
     fn token_id_extracts_name() {
-        let token = AuthToken::new(
+        let token = ApiToken::new(
             "token-abc123:secretvalue".into(),
             Instant::now() + Duration::from_secs(3600),
         );
@@ -622,7 +655,7 @@ mod tests {
 
     #[test]
     fn token_id_none_without_colon() {
-        let token = AuthToken::new(
+        let token = ApiToken::new(
             "no-colon-token".into(),
             Instant::now() + Duration::from_secs(3600),
         );
@@ -641,14 +674,11 @@ mod tests {
 
         let client = test_client();
         let server = test_server(&mock.uri());
-        let token_to_delete = AuthToken::new(
+        let token_to_delete = ApiToken::new(
             "token-abc123:secretvalue".into(),
             Instant::now() + Duration::from_secs(3600),
         );
-        let auth_token = AuthToken::new(
-            "session-token:authvalue".into(),
-            Instant::now() + Duration::from_secs(3600),
-        );
+        let auth_token = SessionToken::new("session-token:authvalue".into());
 
         client
             .delete_token(&server, &token_to_delete, &auth_token)
@@ -668,14 +698,11 @@ mod tests {
 
         let client = test_client();
         let server = test_server(&mock.uri());
-        let token_to_delete = AuthToken::new(
+        let token_to_delete = ApiToken::new(
             "token-gone:secretvalue".into(),
             Instant::now() + Duration::from_secs(3600),
         );
-        let auth_token = AuthToken::new(
-            "session-token:authvalue".into(),
-            Instant::now() + Duration::from_secs(3600),
-        );
+        let auth_token = SessionToken::new("session-token:authvalue".into());
 
         let err = client
             .delete_token(&server, &token_to_delete, &auth_token)
@@ -699,10 +726,7 @@ mod tests {
 
         let client = test_client();
         let server = test_server(&mock.uri());
-        let session_token = AuthToken::new(
-            "session-token:sessionvalue".into(),
-            Instant::now() + Duration::from_secs(3600),
-        );
+        let session_token = SessionToken::new("session-token:sessionvalue".into());
 
         let api_token = client
             .create_api_token(&server, &session_token)
@@ -725,10 +749,7 @@ mod tests {
 
         let client = test_client();
         let server = test_server(&mock.uri());
-        let session_token = AuthToken::new(
-            "session-token:sessionvalue".into(),
-            Instant::now() + Duration::from_secs(3600),
-        );
+        let session_token = SessionToken::new("session-token:sessionvalue".into());
 
         let err = client
             .create_api_token(&server, &session_token)

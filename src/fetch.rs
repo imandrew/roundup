@@ -8,13 +8,13 @@ use url::Url;
 use tracing::{info, warn};
 
 use crate::config::Server;
-use crate::rancher::{AuthToken, Cluster, RancherClient};
+use crate::rancher::{ApiToken, Cluster, RancherClient};
 
 const MAX_CONCURRENT_DOWNLOADS: usize = 5;
 
 pub struct DiscoveredServer {
     pub server: Server,
-    pub token: AuthToken,
+    pub token: ApiToken,
     pub clusters: Vec<Cluster>,
 }
 
@@ -29,7 +29,7 @@ pub struct FetchedKubeconfig {
 pub async fn discover_clusters(
     client: &RancherClient,
     servers: &[Server],
-    tokens: &HashMap<Url, AuthToken>,
+    tokens: &HashMap<Url, ApiToken>,
 ) -> Vec<DiscoveredServer> {
     let mut discovery = JoinSet::new();
     for server in servers {
@@ -69,7 +69,7 @@ pub async fn discover_clusters(
 /// Calls `on_progress(completed, total)` after each download attempt (success or failure).
 pub async fn download_kubeconfigs(
     client: &RancherClient,
-    tasks: Vec<(Server, AuthToken, Cluster)>,
+    tasks: Vec<(Server, ApiToken, Cluster)>,
     mut on_progress: impl FnMut(usize, usize),
 ) -> Vec<FetchedKubeconfig> {
     let total = tasks.len();
@@ -114,10 +114,10 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn token_for(server: &Server, value: &str) -> HashMap<Url, AuthToken> {
+    fn token_for(server: &Server, value: &str) -> HashMap<Url, ApiToken> {
         HashMap::from([(
             server.url().clone(),
-            AuthToken::new(value.into(), Instant::now() + Duration::from_secs(3600)),
+            ApiToken::new(value.into(), Instant::now() + Duration::from_secs(3600)),
         )])
     }
 
