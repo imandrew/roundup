@@ -12,7 +12,7 @@ use url::Url;
 use crate::config::{self, AuthType, Config, Server};
 use crate::kubeconfig::{self, ExcludeFilter};
 use crate::password::read_password;
-use crate::rancher::{AuthToken, RancherClient};
+use crate::rancher::{ApiToken, RancherClient};
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(600);
 /// Rotate tokens expiring within 1 day.
@@ -58,6 +58,9 @@ pub enum Command {
         target: String,
     },
 
+    /// Print version
+    Version,
+
     /// Fetch kubeconfigs from all Rancher servers
     Fetch {
         /// Output path for merged kubeconfig
@@ -79,6 +82,10 @@ pub enum Command {
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
+    if let Command::Version = cli.command {
+        return cmd_version();
+    }
+
     let config_path = cli
         .config
         .unwrap_or_else(|| config::config_path().expect("could not determine config path"));
@@ -97,7 +104,13 @@ pub async fn run(cli: Cli) -> Result<()> {
             insecure,
             force_refresh,
         } => cmd_fetch(&config_path, output, exclude, insecure, force_refresh).await,
+        Command::Version => unreachable!(),
     }
+}
+
+fn cmd_version() -> Result<()> {
+    println!("roundup {}", env!("CARGO_PKG_VERSION"));
+    Ok(())
 }
 
 fn cmd_add(config_path: &Path, url: &str, username: String, authtype: AuthType) -> Result<()> {
@@ -122,10 +135,26 @@ fn cmd_list(config_path: &Path) -> Result<()> {
     for server in &cfg.servers {
         println!(
             "  {} (user: {}, auth: {:?})",
-            server.api_base(),
+            server.api_base().cyan(),
             server.username,
             server.auth_type
         );
+        match &server.cached_token {
+            Some(token) if token.is_valid() => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                let days = (token.expires_at() - now) / 86400;
+                println!("    token: {}", format!("{days} days remaining").green());
+            }
+            Some(_) => {
+                println!("    token: {}", "expired".red());
+            }
+            None => {
+                println!("    token: {}", "none".dimmed());
+            }
+        }
     }
 
     Ok(())
@@ -152,7 +181,7 @@ async fn authenticate_servers(
     client: &RancherClient,
     servers: &mut [Server],
     force_refresh: bool,
-) -> Result<(HashMap<Url, AuthToken>, bool)> {
+) -> Result<(HashMap<Url, ApiToken>, bool)> {
     if servers.len() > 1 && std::env::var("ROUNDUP_RANCHER_PASSWORD").is_ok() {
         eprintln!(
             "{}: ROUNDUP_RANCHER_PASSWORD is set and will be used for all {} servers",
@@ -175,9 +204,9 @@ async fn authenticate_servers(
                 "Authenticating to {}... {} {}",
                 server.api_base().cyan(),
                 "ok".green(),
-                "(cached)".dimmed()
+                "(token)".dimmed()
             );
-            tokens.insert(server.url().clone(), AuthToken::from_cached(cached));
+            tokens.insert(server.url().clone(), ApiToken::from_cached(cached));
             continue;
         }
 
@@ -206,8 +235,11 @@ async fn authenticate_servers(
 
         // Step 2: Delete old cached token using the session token (best-effort)
         if let Some(cached) = &server.cached_token {
-            let old_token = AuthToken::from_cached(cached);
-            if let Err(e) = client.delete_token(server, &old_token, &session_token).await {
+            let old_token = ApiToken::from_cached(cached);
+            if let Err(e) = client
+                .delete_token(server, &old_token, &session_token)
+                .await
+            {
                 warn!(server = %server.api_base(), error = %e, "failed to delete old token");
             }
         }
@@ -217,6 +249,9 @@ async fn authenticate_servers(
             .create_api_token(server, &session_token)
             .await
             .with_context(|| format!("failed to create API token for {}", server.api_base()))?;
+
+        // Step 4: Invalidate the ephemeral session token
+        client.logout(server, &session_token).await;
 
         println!(
             "Authenticating to {}... {}",
